@@ -1,10 +1,10 @@
-description: Force Uppercase character (reads host Caps Lock state and always sends uppercase)
+description: Force Uppercase behavior (always sends uppercase letter regardless of Caps Lock state)
 
 compatible: "zmk,behavior-force-upper"
 
-include: one_param.yaml   # Allows usage like &force_upper A
+include: one_param.yaml
 
 properties:
-  bindings:
-    type: phandle-array
+  label:
+    type: string
     required: false
