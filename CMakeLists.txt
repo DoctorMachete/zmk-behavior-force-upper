@@ -1,5 +1,6 @@
-zephyr_library()
+# Copyright (c) 2025 The ZMK Contributors
+# SPDX-License-Identifier: MIT
 
-zephyr_library_sources(
-  src/force_upper.c
-)
+if ((NOT CONFIG_ZMK_SPLIT) OR CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    target_sources(app PRIVATE src/behaviors/behavior_force_upper.c)
+endif()
