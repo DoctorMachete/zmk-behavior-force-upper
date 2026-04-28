@@ -20,6 +20,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
 
+#define ZMK_LED_CAPSLOCK_BIT BIT(1)
+
 static int on_force_upper_binding_pressed(struct zmk_behavior_binding *binding,
                                           struct zmk_behavior_binding_event event) {
     uint32_t keycode = binding->param1;
@@ -27,7 +29,9 @@ static int on_force_upper_binding_pressed(struct zmk_behavior_binding *binding,
     /* Read current CapsLock state as reported by the host */
     zmk_hid_indicators_t indicators = zmk_hid_indicators_get_current_profile();
    // bool caps_active = (indicators & ZMK_HID_INDICATORS_CAPSLOCK) != 0;
-    bool caps_active = (indicators & HID_KBD_LED_CAPS_LOCK) != 0;
+  
+    #define ZMK_LED_CAPSLOCK_BIT BIT(1)
+    bool caps_active = (indicators & ZMK_LED_CAPSLOCK_BIT) != 0;
     int ret;
 
     if (!caps_active) {
@@ -50,7 +54,7 @@ static int on_force_upper_binding_released(struct zmk_behavior_binding *binding,
     uint32_t keycode = binding->param1;
 
     zmk_hid_indicators_t indicators = zmk_hid_indicators_get_current_profile();
-    bool caps_active = (indicators & ZMK_HID_INDICATORS_CAPSLOCK) != 0;
+    bool caps_active = (indicators & ZMK_LED_CAPSLOCK_BIT) != 0;
 
     int ret;
 
