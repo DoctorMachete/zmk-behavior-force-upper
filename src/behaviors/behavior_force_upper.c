@@ -9,6 +9,7 @@
 #include <zephyr/device.h>
 #include <zephyr/logging/log.h>
 #include <drivers/behavior.h>
+#include <zmk/hid.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -24,7 +25,8 @@ static int on_force_upper_binding_pressed(struct zmk_behavior_binding *binding,
 
     /* Read current CapsLock state as reported by the host */
     zmk_hid_indicators_t indicators = zmk_hid_indicators_get_current_profile();
-    bool caps_active = (indicators & ZMK_HID_INDICATORS_CAPSLOCK) != 0;
+   // bool caps_active = (indicators & ZMK_HID_INDICATORS_CAPSLOCK) != 0;
+    bool caps_active = (indicators & HID_REPORT_MODIFIER_LEFT_SHIFT_FLAG) != 0;
 
     int ret;
 
