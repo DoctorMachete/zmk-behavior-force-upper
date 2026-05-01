@@ -11,7 +11,7 @@
             #binding-cells = <1>;
         };
 
-        /omit-if-no-ref/ flcase: fucase {
+        /omit-if-no-ref/ flcase: flcase {
             compatible = "zmk,behavior-force-lower";
             #binding-cells = <1>;
         };
