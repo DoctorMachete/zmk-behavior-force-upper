@@ -15,6 +15,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/events/keycode_state_changed.h>
 #include <zmk/hid_indicators.h>
 
+#define ZMK_LED_CAPSLOCK_BIT BIT(1)         // *** from https://github.com/darknao/zmk/blob/2fad527cc5abed5bb59b4d4a4b0ee511d0e514e9/app/src/rgb_underglow.c#L320 ***
+
 /* -----------------------------------------------------------------------
  * Shared helper
  *
@@ -97,7 +99,7 @@ static int send_key(uint32_t keycode, bool pressed, bool need_shift,
  * ----------------------------------------------------------------------- */
 static void read_input_state(bool *caps_active, bool *shift_held) {
     zmk_hid_indicators_t ind = zmk_hid_indicators_get_current_profile();
-    *caps_active = (ind & ZMK_HID_INDICATORS_CAPSLOCK) != 0;
+    *caps_active = (ind & ZMK_LED_CAPSLOCK_BIT) != 0;
 
     zmk_mods_t mods = zmk_hid_get_explicit_mods();
     *shift_held = (mods & (MOD_LSFT | MOD_RSFT)) != 0;
