@@ -26,15 +26,6 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define LSHIFT_USAGE 0xE1
 #define RSHIFT_USAGE 0xE5
 
-/*
- * HID keyboard usage 0x00 is "Reserved" — hid_listener skips it
- * (zmk_hid_press returns -EINVAL for usage 0, so nothing is added to the
- * keyboard report). But sticky key's keycode_state_changed listener does
- * NOT filter by keycode validity — it fires on any press event that isn't
- * its own, which is all we need to trigger its release scheduling.
- */
-#define DUMMY_KEYCODE 0x00
-
 /* -----------------------------------------------------------------------
  * Per-key press state — snapshotted at press time, consumed at release.
  * ----------------------------------------------------------------------- */
@@ -58,72 +49,59 @@ static bool is_sticky_shift(void) {
 }
 
 /* -----------------------------------------------------------------------
- * Notify sticky key that a key was pressed/released, by raising a
- * keycode_state_changed event on the bus with a reserved (no-op) keycode.
- *
- * hid_listener will attempt zmk_hid_press(HID_USAGE_KEY, 0x00) which
- * returns -EINVAL and does nothing to the report. But sticky key's
- * listener fires on ANY keycode_state_changed event that isn't its own,
- * so it will schedule its modifier release in response.
- * ----------------------------------------------------------------------- */
-static void notify_sticky_key_bus(bool pressed, int64_t timestamp) {
-    raise_zmk_keycode_state_changed_from_encoded(DUMMY_KEYCODE, pressed, timestamp);
-}
-
-/* -----------------------------------------------------------------------
  * Shared helper.
  *
- * want_upper:       true  → produce uppercase regardless of CapsLock
- *                   false → produce lowercase regardless of CapsLock
- * shift_was_sticky: true  → notify bus so sticky key schedules release
- *                   false → leave shift state untouched
+ * How sticky key works (from source):
  *
- * Sequence for sticky shift case:
- *   PRESS:
- *     1. notify_sticky_key_bus(press)  → sticky key sees a key pressed,
- *                                        schedules its modifier release
- *     2. zmk_hid_masked_modifiers_set  → wipe shift from report
- *     3. zmk_hid_implicit_modifiers    → inject correct shift if needed
- *     4. zmk_hid_press + send_report   → send our key with correct case
- *     5. restore implicit + mask
- *   RELEASE:
- *     1. notify_sticky_key_bus(release) → sticky key sees key released,
- *                                         fires its pending release now
- *     2. same HID sequence as press
- *     3. consume_sticky_shift()         → direct cleanup in case sticky
- *                                         key's release hasn't fired yet
+ *   Listener fires on zmk_keycode_state_changed events.
  *
- * report_shift = want_upper XOR caps_active
+ *   On key DOWN: records modified_key_usage_page/keycode, stops timer,
+ *     and if quick_release && timer_started → queues release after reraise.
+ *
+ *   On key UP: if modified_key_usage_page/keycode matches → releases.
+ *
+ *   timer_started is set in on_sticky_key_binding_released (when the
+ *   sticky key physical key is released), so it is always true by the
+ *   time we press the next key.
+ *
+ * Therefore to make sticky key release correctly we MUST raise the real
+ * keycode on the bus for both press and release. hid_listener will
+ * process these events and modify the HID report — but we immediately
+ * follow with our own masked/corrected send_report that overrides it.
+ *
+ * Sequence:
+ *   1. raise_zmk_keycode_state_changed_from_encoded(keycode, pressed)
+ *        → sticky key listener fires synchronously:
+ *          - press: records keycode, queues release (quick_release)
+ *          - release: sees matching keycode, triggers release_sticky_key_behavior
+ *        → hid_listener also fires, modifying the report with wrong shift
+ *   2. zmk_hid_masked_modifiers_set + implicit inject → correct shift
+ *   3. zmk_hid_press/release → correct key state (already set by step 1,
+ *        but we redo it to be safe)
+ *   4. zmk_endpoints_send_report → send with corrected modifier state,
+ *        overriding whatever hid_listener put in the report in step 1
+ *   5. restore implicit + mask
+ *
+ * The key insight: ZMK's event system processes listeners synchronously
+ * in priority order. raise_zmk_keycode_state_changed_from_encoded returns
+ * only after all listeners (including sticky key and hid_listener) have
+ * run. So by step 2 we know sticky key has already done its work, and
+ * hid_listener has set the report — we then fix the report in steps 2-4.
  * ----------------------------------------------------------------------- */
-
-static void consume_sticky_shift(void) {
-    zmk_mod_flags_t active = zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS;
-    if (!active) {
-        return;
-    }
-    if ((active & MOD_LSFT) &&
-        !zmk_hid_is_pressed(ZMK_HID_USAGE(HID_USAGE_KEY, LSHIFT_USAGE))) {
-        zmk_hid_unregister_mods(MOD_LSFT);
-    }
-    if ((active & MOD_RSFT) &&
-        !zmk_hid_is_pressed(ZMK_HID_USAGE(HID_USAGE_KEY, RSHIFT_USAGE))) {
-        zmk_hid_unregister_mods(MOD_RSFT);
-    }
-    zmk_endpoints_send_report(HID_USAGE_KEY);
-}
-
-static int send_key(uint32_t keycode, bool pressed, bool want_upper,
-                    bool shift_was_sticky, int64_t timestamp) {
+static int send_key(uint32_t keycode, bool pressed, bool want_upper) {
     /*
-     * Notify the event bus BEFORE touching HID state so sticky key's
-     * listener fires while shift is still in explicit_modifiers.
-     * On press: sticky key schedules release (to fire on next key release).
-     * On release: sticky key fires its pending release immediately.
+     * Step 1: raise the real keycode on the bus.
+     * This lets sticky key's listener fire and process the event correctly
+     * (recording the keycode on press, releasing on key-up).
+     * hid_listener will also fire and set the report — but we override it.
      */
-    if (shift_was_sticky) {
-        notify_sticky_key_bus(pressed, timestamp);
-    }
+    raise_zmk_keycode_state_changed_from_encoded(keycode, pressed, k_uptime_get());
 
+    /*
+     * Steps 2-5: override the HID report with the correct shift state.
+     * At this point sticky key has already done its cleanup, so
+     * explicit_modifiers reflects the post-sticky state.
+     */
     zmk_hid_indicators_t ind = zmk_hid_indicators_get_current_profile();
     bool caps_active  = (ind & ZMK_LED_CAPSLOCK_BIT) != 0;
     bool report_shift = want_upper ^ caps_active;
@@ -134,37 +112,27 @@ static int send_key(uint32_t keycode, bool pressed, bool want_upper,
         zmk_hid_implicit_modifiers_press(MOD_LSFT);
     }
 
-    int ret;
+    /* Re-apply key state directly to be certain it's correct */
     if (pressed) {
-        ret = zmk_hid_press(ZMK_HID_USAGE(HID_USAGE_KEY, keycode));
+        zmk_hid_press(ZMK_HID_USAGE(HID_USAGE_KEY, keycode));
     } else {
-        ret = zmk_hid_release(ZMK_HID_USAGE(HID_USAGE_KEY, keycode));
+        zmk_hid_release(ZMK_HID_USAGE(HID_USAGE_KEY, keycode));
     }
 
-    if (ret == 0) {
-        ret = zmk_endpoints_send_report(HID_USAGE_KEY);
-    }
+    int ret = zmk_endpoints_send_report(HID_USAGE_KEY);
 
     if (report_shift) {
         zmk_hid_implicit_modifiers_release();
     }
     zmk_hid_masked_modifiers_clear();
 
-    /*
-     * On release: also call consume_sticky_shift() as a safety net in
-     * case sticky key's own release machinery hasn't fired yet by the
-     * time we send our report. The unregister is ref-counted so if
-     * sticky key already cleaned up this is a no-op.
-     */
-    if (!pressed && shift_was_sticky) {
-        consume_sticky_shift();
-    }
-
     return ret;
 }
 
 /* -----------------------------------------------------------------------
  * FORCE-UPPER (fucase)
+ * Ignores CapsLock. Shift inverts: no shift → upper, shift → lower.
+ * want_upper is snapshotted at press and reused at release.
  * ----------------------------------------------------------------------- */
 #define DT_DRV_COMPAT zmk_behavior_force_upper
 
@@ -177,15 +145,13 @@ static int on_force_upper_binding_pressed(struct zmk_behavior_binding *binding,
     struct force_case_state *state = &force_upper_state[0];
     state->shift_held   = (zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS) != 0;
     state->shift_sticky = is_sticky_shift();
-    return send_key(binding->param1, true, !state->shift_held,
-                    state->shift_sticky, event.timestamp);
+    return send_key(binding->param1, true, !state->shift_held);
 }
 
 static int on_force_upper_binding_released(struct zmk_behavior_binding *binding,
                                            struct zmk_behavior_binding_event event) {
     struct force_case_state *state = &force_upper_state[0];
-    return send_key(binding->param1, false, !state->shift_held,
-                    state->shift_sticky, event.timestamp);
+    return send_key(binding->param1, false, !state->shift_held);
 }
 
 static const struct behavior_driver_api force_upper_driver_api = {
@@ -201,6 +167,7 @@ BEHAVIOR_DT_INST_DEFINE(0, NULL, NULL, NULL, NULL,
 
 /* -----------------------------------------------------------------------
  * FORCE-LOWER (flcase)
+ * Ignores CapsLock. Shift inverts: no shift → lower, shift → upper.
  * ----------------------------------------------------------------------- */
 #undef DT_DRV_COMPAT
 #define DT_DRV_COMPAT zmk_behavior_force_lower
@@ -214,15 +181,13 @@ static int on_force_lower_binding_pressed(struct zmk_behavior_binding *binding,
     struct force_case_state *state = &force_lower_state[0];
     state->shift_held   = (zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS) != 0;
     state->shift_sticky = is_sticky_shift();
-    return send_key(binding->param1, true, state->shift_held,
-                    state->shift_sticky, event.timestamp);
+    return send_key(binding->param1, true, state->shift_held);
 }
 
 static int on_force_lower_binding_released(struct zmk_behavior_binding *binding,
                                            struct zmk_behavior_binding_event event) {
     struct force_case_state *state = &force_lower_state[0];
-    return send_key(binding->param1, false, state->shift_held,
-                    state->shift_sticky, event.timestamp);
+    return send_key(binding->param1, false, state->shift_held);
 }
 
 static const struct behavior_driver_api force_lower_driver_api = {
@@ -247,12 +212,12 @@ BEHAVIOR_DT_INST_DEFINE(0, NULL, NULL, NULL, NULL,
 
 static int on_force_true_upper_binding_pressed(struct zmk_behavior_binding *binding,
                                                struct zmk_behavior_binding_event event) {
-    return send_key(binding->param1, true, true, false, event.timestamp);
+    return send_key(binding->param1, true, true);
 }
 
 static int on_force_true_upper_binding_released(struct zmk_behavior_binding *binding,
                                                 struct zmk_behavior_binding_event event) {
-    return send_key(binding->param1, false, true, false, event.timestamp);
+    return send_key(binding->param1, false, true);
 }
 
 static const struct behavior_driver_api force_true_upper_driver_api = {
@@ -277,12 +242,12 @@ BEHAVIOR_DT_INST_DEFINE(0, NULL, NULL, NULL, NULL,
 
 static int on_force_true_lower_binding_pressed(struct zmk_behavior_binding *binding,
                                                struct zmk_behavior_binding_event event) {
-    return send_key(binding->param1, true, false, false, event.timestamp);
+    return send_key(binding->param1, true, false);
 }
 
 static int on_force_true_lower_binding_released(struct zmk_behavior_binding *binding,
                                                 struct zmk_behavior_binding_event event) {
-    return send_key(binding->param1, false, false, false, event.timestamp);
+    return send_key(binding->param1, false, false);
 }
 
 static const struct behavior_driver_api force_true_lower_driver_api = {
