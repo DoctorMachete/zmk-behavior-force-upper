@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2025 The ZMK Contributors
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: MIT 
  */
 
 #include <zephyr/device.h>
