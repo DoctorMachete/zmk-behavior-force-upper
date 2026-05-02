@@ -24,42 +24,82 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define ZMK_SHIFT_MODS (MOD_LSFT | MOD_RSFT)
 
 /* -----------------------------------------------------------------------
- * Sticky shift mechanics:
+ * Distinguishing sticky shift from physical shift:
  *
- * When &sk LSFT fires, it raises a keycode_state_changed PRESS for LSHIFT
- * on the event bus. hid_listener processes it and calls zmk_hid_register_mod(),
- * putting it into explicit_modifiers. It then waits for the next key's
- * keycode_state_changed RELEASE event, at which point it raises its own
- * LSHIFT release event to clean up.
+ * Both land in explicit_modifiers via zmk_hid_register_mod() so we cannot
+ * tell them apart by reading explicit_modifiers alone.
  *
- * Because we bypass the event bus (zmk_hid_press + zmk_endpoints_send_report
- * directly), sticky key never sees a keycode_state_changed release for our
- * key and never fires its own LSHIFT release. Shift gets stuck.
+ * The trick: raise a LSHIFT release event on the bus and then immediately
+ * check explicit_modifiers again.
  *
- * Fix: after sending our report, raise a keycode_state_changed RELEASE for
- * LSHIFT on the bus. This is exactly what sticky key is listening for —
- * it will fire its cleanup and clear LSHIFT from explicit_modifiers cleanly.
- * This release event is only raised if shift was actually held (sticky or
- * physical) so we don't inject spurious releases.
+ *   - Sticky shift: the release event triggers sticky key's cleanup
+ *     handler, which calls zmk_hid_unregister_mod(LSFT). Shift is now
+ *     gone from explicit_modifiers → was sticky, release was correct.
  *
- * We snapshot shift_held BEFORE masking, use it to determine want_upper
- * at the call site, and pass it into send_key so it knows whether to
- * fire the release event.
+ *   - Physical shift: the release event goes through hid_listener which
+ *     calls zmk_hid_unregister_mod(LSFT). But the key is still physically
+ *     held, so the next scan cycle will re-press it. However we don't want
+ *     to drop the shift even momentarily. So if after the release event
+ *     shift is gone but was physical, we immediately re-press it by raising
+ *     a LSHIFT press event to restore the state.
+ *
+ * We detect which case we are in by reading explicit_modifiers BEFORE and
+ * AFTER raising the release:
+ *   - If shift is gone after the release → sticky → done, leave it gone.
+ *   - If shift is still there after the release → physical shift re-pressed
+ *     itself already (or hid_listener didn't process yet). Either way we
+ *     should NOT have released it → raise a compensating LSHIFT press.
+ *
+ * Actually the most robust detection: check zmk_hid_get_explicit_mods()
+ * after the release event. If the ZMK event system processes synchronously
+ * (which it does for non-deferred listeners), sticky key's unregister will
+ * have already run by the time raise_zmk_keycode_state_changed_from_encoded
+ * returns. Physical shift's hid_listener unregister will also have run,
+ * dropping shift. Then we check: is the physical shift key still logically
+ * pressed in ZMK? We can do this by checking if the LSHIFT *keycode* (not
+ * modifier) is still in the pressed-keys tracking.
+ *
+ * ZMK tracks pressed keys via zmk_hid_is_pressed() for keycodes:
+ *   zmk_hid_is_pressed(ZMK_HID_USAGE(HID_USAGE_KEY, LEFT_SHIFT_USAGE))
+ * This returns true only if zmk_hid_press() was called for LSHIFT, which
+ * only happens for physical key presses through hid_listener, NOT for
+ * sticky key (which only calls zmk_hid_register_mod, not zmk_hid_press).
+ *
+ * So the detection is clean and simple:
+ *   sticky_shift = shift in explicit_mods AND LSHIFT not in pressed keys
+ *   physical_shift = shift in explicit_mods AND LSHIFT in pressed keys
  * ----------------------------------------------------------------------- */
-static int send_key(uint32_t keycode, bool pressed, bool want_upper, bool shift_was_held) {
+
+/* HID usage code for Left Shift key (from HID spec, keyboard page) */
+#define LSHIFT_USAGE 0xE1
+#define RSHIFT_USAGE 0xE5
+
+static bool is_sticky_shift(void) {
+    if (!(zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS)) {
+        return false; /* no shift at all */
+    }
+    /*
+     * If physical shift is held, hid_listener called zmk_hid_press() for
+     * the LSHIFT or RSHIFT keycode, so it appears in the pressed-keys
+     * bitmap. Sticky shift only called zmk_hid_register_mod(), so it does
+     * NOT appear in pressed-keys.
+     */
+    bool lshift_key_pressed = zmk_hid_is_pressed(ZMK_HID_USAGE(HID_USAGE_KEY, LSHIFT_USAGE));
+    bool rshift_key_pressed = zmk_hid_is_pressed(ZMK_HID_USAGE(HID_USAGE_KEY, RSHIFT_USAGE));
+    return !lshift_key_pressed && !rshift_key_pressed;
+}
+
+static int send_key(uint32_t keycode, bool pressed, bool want_upper, bool shift_was_sticky) {
     zmk_hid_indicators_t ind = zmk_hid_indicators_get_current_profile();
     bool caps_active  = (ind & ZMK_LED_CAPSLOCK_BIT) != 0;
     bool report_shift = want_upper ^ caps_active;
 
-    /* Mask all physical/sticky shift out of the report */
     zmk_hid_masked_modifiers_set(ZMK_SHIFT_MODS);
 
-    /* Inject shift via implicit if needed — survives the mask */
     if (report_shift) {
         zmk_hid_implicit_modifiers_press(MOD_LSFT);
     }
 
-    /* Update key state directly, bypassing the event bus */
     int ret;
     if (pressed) {
         ret = zmk_hid_press(ZMK_HID_USAGE(HID_USAGE_KEY, keycode));
@@ -71,23 +111,17 @@ static int send_key(uint32_t keycode, bool pressed, bool want_upper, bool shift_
         ret = zmk_endpoints_send_report(HID_USAGE_KEY);
     }
 
-    /* Restore implicit and mask unconditionally */
     if (report_shift) {
         zmk_hid_implicit_modifiers_release();
     }
     zmk_hid_masked_modifiers_clear();
 
     /*
-     * On key RELEASE: if shift was held when the key was pressed, raise a
-     * LSHIFT release event on the bus now. This is what sticky key is
-     * waiting for — it will respond by releasing its hold on LSHIFT and
-     * clearing it from explicit_modifiers. Without this, sticky shift
-     * never releases and gets stuck.
-     *
-     * We do this on release (not press) to mirror normal key sequencing:
-     * sticky key releases its modifier after the modified key is released.
+     * On key release: if shift was sticky at press time, trigger its
+     * cleanup now by raising a LSHIFT release on the bus.
+     * Physical shift is NOT released — it stays held naturally.
      */
-    if (!pressed && shift_was_held) {
+    if (!pressed && shift_was_sticky) {
         raise_zmk_keycode_state_changed_from_encoded(LSHIFT, false, k_uptime_get());
     }
 
@@ -104,115 +138,9 @@ static int send_key(uint32_t keycode, bool pressed, bool want_upper, bool shift_
 
 static int on_force_upper_binding_pressed(struct zmk_behavior_binding *binding,
                                           struct zmk_behavior_binding_event event) {
-    bool shift_held = (zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS) != 0;
-    return send_key(binding->param1, true, !shift_held, shift_held);
+    bool shift_held   = (zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS) != 0;
+    bool shift_sticky = is_sticky_shift();
+    return send_key(binding->param1, true, !shift_held, shift_sticky);
 }
 
 static int on_force_upper_binding_released(struct zmk_behavior_binding *binding,
-                                           struct zmk_behavior_binding_event event) {
-    bool shift_held = (zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS) != 0;
-    return send_key(binding->param1, false, !shift_held, shift_held);
-}
-
-static const struct behavior_driver_api force_upper_driver_api = {
-    .binding_pressed  = on_force_upper_binding_pressed,
-    .binding_released = on_force_upper_binding_released,
-};
-
-BEHAVIOR_DT_INST_DEFINE(0, NULL, NULL, NULL, NULL,
-                        POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,
-                        &force_upper_driver_api);
-
-#endif /* DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT) */
-
-/* -----------------------------------------------------------------------
- * FORCE-LOWER (flcase)
- * Ignores CapsLock. Shift inverts: no shift → lower, shift → upper.
- * ----------------------------------------------------------------------- */
-#undef DT_DRV_COMPAT
-#define DT_DRV_COMPAT zmk_behavior_force_lower
-
-#if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
-
-static int on_force_lower_binding_pressed(struct zmk_behavior_binding *binding,
-                                          struct zmk_behavior_binding_event event) {
-    bool shift_held = (zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS) != 0;
-    return send_key(binding->param1, true, shift_held, shift_held);
-}
-
-static int on_force_lower_binding_released(struct zmk_behavior_binding *binding,
-                                           struct zmk_behavior_binding_event event) {
-    bool shift_held = (zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS) != 0;
-    return send_key(binding->param1, false, shift_held, shift_held);
-}
-
-static const struct behavior_driver_api force_lower_driver_api = {
-    .binding_pressed  = on_force_lower_binding_pressed,
-    .binding_released = on_force_lower_binding_released,
-};
-
-BEHAVIOR_DT_INST_DEFINE(0, NULL, NULL, NULL, NULL,
-                        POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,
-                        &force_lower_driver_api);
-
-#endif /* DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT) */
-
-/* -----------------------------------------------------------------------
- * FORCE-TRUE-UPPER (ftucase)
- * Always outputs uppercase. Ignores BOTH CapsLock and Shift entirely.
- * ----------------------------------------------------------------------- */
-#undef DT_DRV_COMPAT
-#define DT_DRV_COMPAT zmk_behavior_force_true_upper
-
-#if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
-
-static int on_force_true_upper_binding_pressed(struct zmk_behavior_binding *binding,
-                                               struct zmk_behavior_binding_event event) {
-    return send_key(binding->param1, true, true, false);
-}
-
-static int on_force_true_upper_binding_released(struct zmk_behavior_binding *binding,
-                                                struct zmk_behavior_binding_event event) {
-    return send_key(binding->param1, false, true, false);
-}
-
-static const struct behavior_driver_api force_true_upper_driver_api = {
-    .binding_pressed  = on_force_true_upper_binding_pressed,
-    .binding_released = on_force_true_upper_binding_released,
-};
-
-BEHAVIOR_DT_INST_DEFINE(0, NULL, NULL, NULL, NULL,
-                        POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,
-                        &force_true_upper_driver_api);
-
-#endif /* DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT) */
-
-/* -----------------------------------------------------------------------
- * FORCE-TRUE-LOWER (ftlcase)
- * Always outputs lowercase. Ignores BOTH CapsLock and Shift entirely.
- * ----------------------------------------------------------------------- */
-#undef DT_DRV_COMPAT
-#define DT_DRV_COMPAT zmk_behavior_force_true_lower
-
-#if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
-
-static int on_force_true_lower_binding_pressed(struct zmk_behavior_binding *binding,
-                                               struct zmk_behavior_binding_event event) {
-    return send_key(binding->param1, true, false, false);
-}
-
-static int on_force_true_lower_binding_released(struct zmk_behavior_binding *binding,
-                                                struct zmk_behavior_binding_event event) {
-    return send_key(binding->param1, false, false, false);
-}
-
-static const struct behavior_driver_api force_true_lower_driver_api = {
-    .binding_pressed  = on_force_true_lower_binding_pressed,
-    .binding_released = on_force_true_lower_binding_released,
-};
-
-BEHAVIOR_DT_INST_DEFINE(0, NULL, NULL, NULL, NULL,
-                        POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,
-                        &force_true_lower_driver_api);
-
-#endif /* DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT) */
