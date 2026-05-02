@@ -23,7 +23,6 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #define ZMK_SHIFT_MODS (MOD_LSFT | MOD_RSFT)
 
-/* HID usage codes for Left/Right Shift keys (USB HID keyboard page) */
 #define LSHIFT_USAGE 0xE1
 #define RSHIFT_USAGE 0xE5
 
@@ -37,11 +36,8 @@ struct force_case_state {
 
 /* -----------------------------------------------------------------------
  * Detect sticky shift vs physical shift.
- *
- * Physical shift: hid_listener called zmk_hid_press(LSHIFT/RSHIFT usage)
- *   → keycode appears in the pressed-keys bitmap.
- * Sticky shift: behavior_sticky_key only called zmk_hid_register_mod()
- *   → keycode NOT in the pressed-keys bitmap.
+ * Sticky: in explicit_mods but NOT in pressed-keys bitmap.
+ * Physical: in explicit_mods AND in pressed-keys bitmap.
  * ----------------------------------------------------------------------- */
 static bool is_sticky_shift(void) {
     if (!(zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS)) {
@@ -53,28 +49,24 @@ static bool is_sticky_shift(void) {
 }
 
 /* -----------------------------------------------------------------------
- * Directly consume sticky shift by unregistering its modifier from the
- * HID layer and sending an updated report.
+ * Directly consume sticky shift.
  *
- * We don't try to interact with sticky key's internal state machine via
- * events. Instead we do exactly what sticky key's cleanup would do:
- * call zmk_hid_unregister_mods() for whichever shift bits are active
- * in explicit_modifiers but NOT in the pressed-keys bitmap (i.e. sticky).
+ * Called on key RELEASE (not press), because default sticky keys in ZMK
+ * v0.3 without quick-release stay active until the modified key is
+ * RELEASED, not just pressed. This matches their natural release timing.
  *
- * zmk_hid_unregister_mods decrements the ref-count and removes the bit
- * from explicit_modifiers when it hits zero. We then send the report so
- * the host sees the updated (no shift) modifier state immediately.
+ * We unregister shift from explicit_modifiers directly instead of waiting
+ * for sticky key's own timeout/event machinery, then send a report so the
+ * host immediately sees shift is gone.
  *
- * Sticky key's own cleanup will still fire eventually when its timeout
- * expires or its position event fires, but since the mod ref-count will
- * already be zero, its unregister call will be a no-op.
+ * Sticky key's own delayed cleanup will still fire, but
+ * zmk_hid_unregister_mods is ref-counted so the second call is a no-op.
  * ----------------------------------------------------------------------- */
 static void consume_sticky_shift(void) {
     zmk_mod_flags_t active = zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS;
     if (!active) {
         return;
     }
-    /* Unregister only the shift bits that are sticky (not in pressed keys) */
     if ((active & MOD_LSFT) &&
         !zmk_hid_is_pressed(ZMK_HID_USAGE(HID_USAGE_KEY, LSHIFT_USAGE))) {
         zmk_hid_unregister_mods(MOD_LSFT);
@@ -83,7 +75,6 @@ static void consume_sticky_shift(void) {
         !zmk_hid_is_pressed(ZMK_HID_USAGE(HID_USAGE_KEY, RSHIFT_USAGE))) {
         zmk_hid_unregister_mods(MOD_RSFT);
     }
-    /* Send the updated modifier report so the host sees shift is gone */
     zmk_endpoints_send_report(HID_USAGE_KEY);
 }
 
@@ -92,14 +83,10 @@ static void consume_sticky_shift(void) {
  *
  * want_upper:       true  → produce uppercase regardless of CapsLock
  *                   false → produce lowercase regardless of CapsLock
- * shift_was_sticky: true  → directly consume sticky shift after sending
+ * shift_was_sticky: true  → consume sticky shift on key RELEASE
  *                   false → leave shift state untouched
  *
- * report_shift = want_upper XOR caps_active:
- *   caps=0 want_upper=1 → shift=1
- *   caps=0 want_upper=0 → shift=0
- *   caps=1 want_upper=1 → shift=0
- *   caps=1 want_upper=0 → shift=1
+ * report_shift = want_upper XOR caps_active
  * ----------------------------------------------------------------------- */
 static int send_key(uint32_t keycode, bool pressed, bool want_upper,
                     bool shift_was_sticky) {
@@ -130,12 +117,13 @@ static int send_key(uint32_t keycode, bool pressed, bool want_upper,
     zmk_hid_masked_modifiers_clear();
 
     /*
-     * On key PRESS: if shift was sticky, directly consume it now by
-     * unregistering it from explicit_modifiers and sending a report.
-     * This immediately removes shift from the HID state without needing
-     * any event bus interaction at all.
+     * On key RELEASE: if shift was sticky when this key was pressed,
+     * consume it now. This matches ZMK v0.3 default sticky key timing —
+     * sticky keys release after the modified key is released, not pressed.
+     * We do it ourselves immediately rather than waiting for sticky key's
+     * timeout machinery so the host sees the shift-up report right away.
      */
-    if (pressed && shift_was_sticky) {
+    if (!pressed && shift_was_sticky) {
         consume_sticky_shift();
     }
 
@@ -144,8 +132,6 @@ static int send_key(uint32_t keycode, bool pressed, bool want_upper,
 
 /* -----------------------------------------------------------------------
  * FORCE-UPPER (fucase)
- * Ignores CapsLock. Shift inverts: no shift → upper, shift → lower.
- * Sticky shift consumed on press; physical shift untouched.
  * ----------------------------------------------------------------------- */
 #define DT_DRV_COMPAT zmk_behavior_force_upper
 
@@ -158,13 +144,13 @@ static int on_force_upper_binding_pressed(struct zmk_behavior_binding *binding,
     struct force_case_state *state = &force_upper_state[0];
     state->shift_held   = (zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS) != 0;
     state->shift_sticky = is_sticky_shift();
-    return send_key(binding->param1, true, !state->shift_held, state->shift_sticky);
+    return send_key(binding->param1, true, !state->shift_held, false);
 }
 
 static int on_force_upper_binding_released(struct zmk_behavior_binding *binding,
                                            struct zmk_behavior_binding_event event) {
     struct force_case_state *state = &force_upper_state[0];
-    return send_key(binding->param1, false, !state->shift_held, false);
+    return send_key(binding->param1, false, !state->shift_held, state->shift_sticky);
 }
 
 static const struct behavior_driver_api force_upper_driver_api = {
@@ -180,8 +166,6 @@ BEHAVIOR_DT_INST_DEFINE(0, NULL, NULL, NULL, NULL,
 
 /* -----------------------------------------------------------------------
  * FORCE-LOWER (flcase)
- * Ignores CapsLock. Shift inverts: no shift → lower, shift → upper.
- * Sticky shift consumed on press; physical shift untouched.
  * ----------------------------------------------------------------------- */
 #undef DT_DRV_COMPAT
 #define DT_DRV_COMPAT zmk_behavior_force_lower
@@ -195,13 +179,13 @@ static int on_force_lower_binding_pressed(struct zmk_behavior_binding *binding,
     struct force_case_state *state = &force_lower_state[0];
     state->shift_held   = (zmk_hid_get_explicit_mods() & ZMK_SHIFT_MODS) != 0;
     state->shift_sticky = is_sticky_shift();
-    return send_key(binding->param1, true, state->shift_held, state->shift_sticky);
+    return send_key(binding->param1, true, state->shift_held, false);
 }
 
 static int on_force_lower_binding_released(struct zmk_behavior_binding *binding,
                                            struct zmk_behavior_binding_event event) {
     struct force_case_state *state = &force_lower_state[0];
-    return send_key(binding->param1, false, state->shift_held, false);
+    return send_key(binding->param1, false, state->shift_held, state->shift_sticky);
 }
 
 static const struct behavior_driver_api force_lower_driver_api = {
@@ -217,7 +201,7 @@ BEHAVIOR_DT_INST_DEFINE(0, NULL, NULL, NULL, NULL,
 
 /* -----------------------------------------------------------------------
  * FORCE-TRUE-UPPER (ftucase)
- * Always outputs uppercase. Ignores BOTH CapsLock and Shift entirely.
+ * Always uppercase. Ignores CapsLock and Shift entirely.
  * ----------------------------------------------------------------------- */
 #undef DT_DRV_COMPAT
 #define DT_DRV_COMPAT zmk_behavior_force_true_upper
@@ -247,7 +231,7 @@ BEHAVIOR_DT_INST_DEFINE(0, NULL, NULL, NULL, NULL,
 
 /* -----------------------------------------------------------------------
  * FORCE-TRUE-LOWER (ftlcase)
- * Always outputs lowercase. Ignores BOTH CapsLock and Shift entirely.
+ * Always lowercase. Ignores CapsLock and Shift entirely.
  * ----------------------------------------------------------------------- */
 #undef DT_DRV_COMPAT
 #define DT_DRV_COMPAT zmk_behavior_force_true_lower
