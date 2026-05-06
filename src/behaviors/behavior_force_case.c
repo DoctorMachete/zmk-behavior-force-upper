@@ -21,9 +21,11 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <dt-bindings/zmk/modifiers.h>
 #include <dt-bindings/zmk/hid_usage_pages.h>
 
+#define ZMK_LED_CAPSLOCK_BIT BIT(1) // *** from https://github.com/darknao/zmk/blob/2fad527cc5abed5bb59b4d4a4b0ee511d0e514e9/app/src/rgb_underglow.c#L320 ***
+
 /* Standard ZMK v0.3.0 capslock indicator bit via the public API */
 #define CAPSLOCK_ACTIVE \
-    (zmk_hid_indicators_get_current_profile() & ZMK_HID_INDICATORS_CAPSLOCK)
+    (zmk_hid_indicators_get_current_profile() & ZMK_LED_CAPSLOCK_BIT)
 
 #define ZMK_SHIFT_MODS (MOD_LSFT | MOD_RSFT)
 
