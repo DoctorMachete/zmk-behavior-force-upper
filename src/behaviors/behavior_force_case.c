@@ -21,7 +21,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <dt-bindings/zmk/modifiers.h>
 #include <dt-bindings/zmk/hid_usage_pages.h>
 
-#define ZMK_LED_CAPSLOCK_BIT BIT(1) // *** from https://github.com/darknao/zmk/blob/2fad527cc5abed5bb59b4d4a4b0ee511d0e514e9/app/src/rgb_underglow.c#L320 ***
+/* Standard ZMK v0.3.0 capslock indicator bit via the public API */
+#define CAPSLOCK_ACTIVE \
+    (zmk_hid_indicators_get_current_profile() & ZMK_HID_INDICATORS_CAPSLOCK)
 
 #define ZMK_SHIFT_MODS (MOD_LSFT | MOD_RSFT)
 
@@ -54,17 +56,21 @@ static bool is_sticky_shift(void) {
 /* -----------------------------------------------------------------------
  * Shared helper — mod-morph pattern via zmk_behavior_invoke_binding.
  *
- * No-repeat: on press we send key-down then immediately key-up.
- * The host sees a complete tap regardless of how long the key is held.
- * The release handler does nothing — the key is already out of the report.
+ * Identical strategy to behavior_mod_morph.c:
+ *   1. Set mask/register before invoke so hid_listener's SET_MODIFIERS
+ *      sees the correct shift state when it builds the report.
+ *   2. invoke_binding(press) → sticky key sees real keycode, releases.
+ *   3. invoke_binding(release) immediately → no auto-repeat.
+ *   4. Unregister/clear after invoke.
  *
- * need_mask: shift is held but we don't want it in the report → mask it
- * need_reg:  shift is not held but we need it in the report → register it
+ * report_shift = want_upper XOR caps_active
+ *
+ * need_mask: shift held, don't want it     → mask ZMK_SHIFT_MODS
+ * need_reg:  shift not held, but want it   → register MOD_LSFT temporarily
  * ----------------------------------------------------------------------- */
 static int send_key(uint32_t keycode, bool want_upper,
                     bool shift_held, struct zmk_behavior_binding_event event) {
-    zmk_hid_indicators_t ind = zmk_hid_indicators_get_current_profile();
-    bool caps_active  = (ind & ZMK_LED_CAPSLOCK_BIT) != 0;
+    bool caps_active  = CAPSLOCK_ACTIVE != 0;
     bool report_shift = want_upper ^ caps_active;
 
     bool need_mask = shift_held && !report_shift;
@@ -82,15 +88,16 @@ static int send_key(uint32_t keycode, bool want_upper,
         .param1 = keycode,
     };
 
-    /* Press — sticky key sees real keycode, hid_listener sends correct report */
+    /* Press — sticky key sees real keycode and releases naturally.
+     * hid_listener builds report with our corrected modifier state. */
     int ret = zmk_behavior_invoke_binding(&key_binding, event, true);
 
-    /* Immediately release — removes key from report, prevents auto-repeat.
-     * Host sees a complete tap; holding the key produces no further output. */
+    /* Immediate release — prevents auto-repeat on hold */
     zmk_behavior_invoke_binding(&key_binding, event, false);
 
     if (need_reg) {
         zmk_hid_unregister_mods(MOD_LSFT);
+        /* Send one more report so host sees shift gone after the key */
         zmk_endpoints_send_report(HID_USAGE_KEY);
     }
     if (need_mask) {
@@ -119,7 +126,6 @@ static int on_force_upper_binding_pressed(struct zmk_behavior_binding *binding,
 
 static int on_force_upper_binding_released(struct zmk_behavior_binding *binding,
                                            struct zmk_behavior_binding_event event) {
-    /* Key already released in press handler — nothing to do */
     return 0;
 }
 
